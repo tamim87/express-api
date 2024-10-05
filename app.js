@@ -29,7 +29,25 @@ const storage = multer.diskStorage({
         cb(null, Date.now() + path.extname(file.originalname));
     },
 });
-const upload = multer({ storage: storage });
+
+// Multer configuration to limit file types and size
+const upload = multer({
+    dest: "uploads/",
+    limits: {
+        fileSize: 5 * 1024 * 1024, // Limit file size to 5MB
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = ["image/jpeg", "image/png", "image/gif"];
+        if (!allowedTypes.includes(file.mimetype)) {
+            return cb(
+                new Error(
+                    "Invalid file type. Only JPEG, PNG, and GIF are allowed."
+                )
+            );
+        }
+        cb(null, true);
+    },
+});
 
 // Serve static files from 'uploads'
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
@@ -49,8 +67,7 @@ const verifyToken = (req, res, next) => {
     if (!token)
         return res
             .status(403)
-            .json({ error: "Token is required for authentication" })
-            ;
+            .json({ error: "Token is required for authentication" });
 
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -183,18 +200,21 @@ app.post(
 );
 
 // Get User Profile
+// Get user profile
 app.get("/profile", verifyToken, async (req, res) => {
     try {
         const result = await pool.query(
             "SELECT id, username, email, profile_image FROM users WHERE id = $1",
             [req.user.userId]
         );
-
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "User not found" });
         }
 
-        return res.status(200).json(result.rows[0]);
+        const user = result.rows[0];
+        user.profile_image_url = `/uploads/${user.profile_image}`; // Return the image URL
+
+        return res.json(user);
     } catch (err) {
         console.error("Error fetching user profile:", err);
         return res.status(500).json({ error: "Internal server error" });
@@ -356,6 +376,74 @@ app.post("/upload", verifyToken, upload.single("image"), async (req, res) => {
         return res.status(500).json({ error: "Internal server error" });
     }
 });
+
+// Update user profile image
+app.put(
+    "/profile/image",
+    verifyToken,
+    upload.single("image"),
+    async (req, res) => {
+        if (!req.file) {
+            return res.status(400).json({ error: "No file uploaded" });
+        }
+
+        try {
+            // Begin transaction for safety
+            await pool.query("BEGIN");
+
+            // Get the current profile image filename
+            const userResult = await pool.query(
+                "SELECT profile_image FROM users WHERE id = $1",
+                [req.user.userId]
+            );
+
+            if (userResult.rows.length === 0) {
+                return res.status(404).json({ error: "User not found" });
+            }
+
+            const currentImage = userResult.rows[0].profile_image;
+
+            // Update the user's profile image in the database
+            const result = await pool.query(
+                "UPDATE users SET profile_image = $1 WHERE id = $2 RETURNING profile_image",
+                [req.file.filename, req.user.userId]
+            );
+
+            if (result.rows.length === 0) {
+                throw new Error(
+                    "Failed to update profile image in the database"
+                );
+            }
+
+            // Delete the old image from the file system if it exists
+            if (currentImage) {
+                const oldImagePath = path.join(
+                    __dirname,
+                    "uploads",
+                    currentImage
+                );
+                fs.unlink(oldImagePath, (err) => {
+                    if (err) {
+                        console.error("Error deleting old profile image:", err);
+                    }
+                });
+            }
+
+            // Commit the transaction
+            await pool.query("COMMIT");
+
+            return res.status(200).json({
+                message: "Profile image updated successfully",
+                profile_image_url: `/uploads/${req.file.filename}`,
+            });
+        } catch (err) {
+            // Rollback on error
+            await pool.query("ROLLBACK");
+            console.error("Error updating profile image:", err);
+            return res.status(500).json({ error: "Internal server error" });
+        }
+    }
+);
 
 // Start the server
 const PORT = process.env.PORT || 3000;
